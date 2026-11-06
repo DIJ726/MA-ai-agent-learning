@@ -1,13 +1,16 @@
 """天气智能助手：网页对话式天气查询与分析。
 
-功能：在网页对话框输入任意城市或地区，程序自动调用和风天气 API
-获取「过去 5 天历史 + 未来 7 天预报 + 实时空气质量」，再把原始数据
-交给千问大模型分析，生成通俗易懂的天气总结和出行建议。
+功能：在网页对话框输入城市 + 具体日期（一次最多 3 个城市），程序调用
+和风天气 API 获取「过去 5 天历史 + 未来 7 天预报 + 实时空气质量」，
+多城市数据用 httpx.AsyncClient 异步并发获取（3 城约等于 1 城的耗时），
+再把原始数据交给千问大模型分析，重点回答用户问的日期，并给出出行建议。
+只有用户问到具体日期才查询数据；只说城市时助手会先追问日期。
 
 运行方式：python weather_assistant.py，浏览器自动打开 http://127.0.0.1:8765
 密钥存放：同目录 .env 文件（DASHSCOPE_API_KEY / QWEATHER_API_KEY / QWEATHER_API_HOST）
 """
 
+import asyncio
 import json
 import time
 import webbrowser
@@ -18,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+import httpx
 import requests
 
 # ---------------------------------------------------------------------------
@@ -32,26 +36,30 @@ LLM_BASE_URL = "https://ws-ljhpruzo85ykejwp.cn-beijing.maas.aliyuncs.com/compati
 HISTORY_DAYS = 5   # 过去 5 天
 FORECAST_DAYS = 7  # 未来 7 天
 MAX_HISTORY_TURNS = 20  # 多轮对话保留的最大轮数
+MAX_CITIES = 3     # 单次最多同时查询 3 个城市
 
 # 千问系统提示词：让模型知道自己的数据来源和输出风格
 ANALYST_SYSTEM_PROMPT = (
-    "你是一名贴心的天气助理。用户会给你一份某个城市的天气原始数据"
+    "你是一名贴心的天气助理。用户会给你一个或多个城市（最多 3 个）的天气原始数据"
     "（过去若干天历史 + 未来若干天预报 + 实时空气质量），"
     "并指定他关心的具体日期。请用中文回答，**重点回答用户指定的那几天**："
-    "当日天气（晴雨、温度范围、风）、和前后一两天对比的趋势（可选）、"
+    "每个城市分别给出当日天气（晴雨、温度范围、风），多城市时做简短横向对比"
+    "（哪个更暖/更可能下雨/更适合出行），"
     "以及针对那几天的出行建议（穿衣、雨具、户外活动、空气敏感人群注意事项）。"
-    "语气自然简洁，不要把 12 天数据全部罗列一遍。"
+    "语气自然简洁，不要把每个城市 12 天数据全部罗列一遍。"
 )
 
-# 提取城市 + 具体日期的系统提示词
+# 提取城市（可多个）+ 具体日期的系统提示词
 CITY_SYSTEM_PROMPT = (
-    "从用户的话里提取：1) 他想查询天气的城市或地区名称；"
+    "从用户的话里提取：1) 他想查询天气的所有城市或地区名称（可能 1~3 个，"
+    "如「北京上海广州这周六天气怎么样」有 3 个城市）；"
     "2) 他明确问到的具体日期。今天是 {today}。"
     "相对说法（今天/明天/后天/大后天/昨天/前天/周几/本周几/这周六等）"
     "和绝对日期（如 11月8日、2026-11-08）都要换算成 yyyy-MM-dd。"
-    '只输出 JSON，格式：{{"city": "城市名", "dates": ["日期1", "日期2"]}}。'
+    '只输出 JSON，格式：{{"cities": ["城市1", "城市2"], "dates": ["日期1", "日期2"]}}。'
     "用户没有明确提到任何具体日期时，dates 必须是空数组 []。"
-    "如果城市也提取不到，city 为空字符串。不要输出任何其他内容。"
+    "城市数量超过 3 个时只保留前 3 个。"
+    "如果一个城市都提取不到，cities 为空数组。不要输出任何其他内容。"
 )
 
 
@@ -209,18 +217,37 @@ QW_HOST = ENV.get("QWEATHER_API_HOST", "")
 
 
 def qweather_get(path: str, params: dict[str, str]) -> dict:
-    """请求和风天气 API 并返回 JSON。
+    """同步请求和风天气 API 并返回 JSON（单次后台调用用）。
+
+    Raises:
+        RuntimeError: 状态码非 200 或网络失败。
+    """
+    return asyncio.run(qweather_get_async(path, params))
+
+
+async def qweather_get_async(path: str, params: dict[str, str],
+                             client: Optional[httpx.AsyncClient] = None) -> dict:
+    """异步请求和风天气 API 并返回 JSON。
+
+    Args:
+        client: 可复用的 httpx.AsyncClient；不传则临时创建一个。
 
     Raises:
         RuntimeError: 状态码非 200 或网络失败。
     """
     url = f"https://{QW_HOST}{path}"
     headers = {"X-QW-Api-Key": QW_KEY}
+    own_client = client is None
+    if own_client:
+        client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS)
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        resp = await client.get(url, params=params, headers=headers)
         resp.raise_for_status()
-    except requests.RequestException as exc:
+    except httpx.HTTPError as exc:
         raise RuntimeError(f"和风天气请求失败: {exc}") from exc
+    finally:
+        if own_client:
+            await client.aclose()
     data = resp.json()
     if str(data.get("code", "200")) != "200":
         raise RuntimeError(f"和风天气返回错误: {data.get('code')}")
@@ -269,17 +296,16 @@ def chat_completion(messages: list[dict], temperature: float = 0.7,
 
 
 # ---------------------------------------------------------------------------
-# 数据获取：城市 → 历史 + 预报 + 空气
+# 数据获取（异步并发版）：城市 → 历史 + 预报 + 空气
 # ---------------------------------------------------------------------------
-@retry(attempts=3)
-@ttl_cache(seconds=600)
-def search_city(query: str) -> CityInfo:
+async def search_city_async(query: str, client: httpx.AsyncClient) -> CityInfo:
     """GeoAPI 城市查询，返回第一个匹配结果。
 
     Raises:
         RuntimeError: 查不到该城市。
     """
-    data = qweather_get("/geo/v2/city/lookup", {"location": query, "lang": "zh"})
+    data = await qweather_get_async(
+        "/geo/v2/city/lookup", {"location": query, "lang": "zh"}, client)
     locations = data.get("location") or []
     if not locations:
         raise RuntimeError(f"查不到城市「{query}」，换个写法试试（如用城市全名）")
@@ -294,10 +320,9 @@ def search_city(query: str) -> CityInfo:
     )
 
 
-@retry(attempts=3)
-def fetch_forecast(city: CityInfo) -> list[DaySummary]:
+async def fetch_forecast_async(city: CityInfo, client: httpx.AsyncClient) -> list[DaySummary]:
     """获取未来 7 天预报。"""
-    data = qweather_get("/v7/weather/7d", {"location": city.location_id})
+    data = await qweather_get_async("/v7/weather/7d", {"location": city.location_id}, client)
     return [
         DaySummary(
             fx_date=d["fxDate"], tag="预报",
@@ -309,13 +334,15 @@ def fetch_forecast(city: CityInfo) -> list[DaySummary]:
     ]
 
 
-@retry(attempts=2)
-def fetch_history_one_day(city: CityInfo, day: date) -> Optional[DaySummary]:
+async def fetch_history_one_day_async(
+    city: CityInfo, day: date, client: httpx.AsyncClient,
+) -> Optional[DaySummary]:
     """获取某一天的历史天气（近 10 天内，不含今天）。失败返回 None，不中断整体。"""
     try:
-        data = qweather_get(
+        data = await qweather_get_async(
             "/v7/historical/weather",
             {"location": city.location_id, "date": day.strftime("%Y%m%d")},
+            client,
         )
     except RuntimeError:
         return None
@@ -329,25 +356,25 @@ def fetch_history_one_day(city: CityInfo, day: date) -> Optional[DaySummary]:
     )
 
 
-def fetch_history(city: CityInfo, days: int = HISTORY_DAYS) -> list[DaySummary]:
-    """获取过去 N 天历史天气（逐天请求）。"""
+async def fetch_history_async(
+    city: CityInfo, client: httpx.AsyncClient, days: int = HISTORY_DAYS,
+) -> list[DaySummary]:
+    """获取过去 N 天历史天气（N 天并发请求，而非逐天串行）。"""
     today = date.today()
-    result: list[DaySummary] = []
-    for offset in range(1, days + 1):
-        day = today - timedelta(days=offset)
-        summary = fetch_history_one_day(city, day)
-        if summary:
-            result.append(summary)
-    return result
+    tasks = [
+        fetch_history_one_day_async(city, today - timedelta(days=offset), client)
+        for offset in range(1, days + 1)
+    ]
+    results = await asyncio.gather(*tasks)
+    return [r for r in results if r]
 
 
-@retry(attempts=2)
-def fetch_air(city: CityInfo) -> Optional[AirBrief]:
+async def fetch_air_async(city: CityInfo, client: httpx.AsyncClient) -> Optional[AirBrief]:
     """获取实时空气质量（取中国国标 AQI）。失败返回 None。"""
     try:
-        data = qweather_get(
+        data = await qweather_get_async(
             f"/airquality/v1/current/{float(city.lat):.2f}/{float(city.lon):.2f}",
-            {"lang": "zh"},
+            {"lang": "zh"}, client,
         )
     except RuntimeError:
         return None
@@ -363,26 +390,40 @@ def fetch_air(city: CityInfo) -> Optional[AirBrief]:
 
 
 @timed
-def build_report(city_query: str) -> WeatherReport:
-    """组装一个城市的完整天气数据包（历史 5 天 + 预报 7 天 + 空气）。"""
-    city = search_city(city_query)
-    history = fetch_history(city)
-    forecast = fetch_forecast(city)
-    air = fetch_air(city)
+async def build_report_async(city_query: str, client: httpx.AsyncClient) -> WeatherReport:
+    """组装单个城市的完整天气数据包（内部三路并发：历史 + 预报 + 空气）。"""
+    city = await search_city_async(city_query, client)
+    history, forecast, air = await asyncio.gather(
+        fetch_history_async(city, client),
+        fetch_forecast_async(city, client),
+        fetch_air_async(city, client),
+    )
     return WeatherReport(
         city=city, history_days=history, forecast_days=forecast,
         air=air, generated_at=time.strftime("%Y-%m-%d %H:%M"),
     )
 
 
+async def build_reports_async(city_queries: list[str]) -> list[WeatherReport]:
+    """并发组装多个城市（最多 3 个）的天气数据包。
+
+    所有城市所有接口同时发出请求，总耗时 ≈ 单城市单接口的耗时。
+    某个城市失败不影响其他城市，失败城市会被跳过。
+    """
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+        tasks = [build_report_async(q, client) for q in city_queries]
+        reports = await asyncio.gather(*tasks, return_exceptions=True)
+    return [r for r in reports if isinstance(r, WeatherReport)]
+
+
 # ---------------------------------------------------------------------------
 # 对话逻辑
 # ---------------------------------------------------------------------------
-def extract_city_and_dates(question: str) -> tuple[str, list[str]]:
-    """用大模型从用户问题中提取城市名和具体日期。
+def extract_cities_and_dates(question: str) -> tuple[list[str], list[str]]:
+    """用大模型从用户问题中提取城市列表（1~3 个）和具体日期。
 
     Returns:
-        (城市名, 日期列表)。无日期时列表为空；提取失败时城市返回原文。
+        (城市列表, 日期列表)。无日期时列表为空；提取失败时城市返回原文。
 
     Raises:
         RuntimeError: 大模型调用失败时按原文当地名处理。
@@ -395,18 +436,26 @@ def extract_city_and_dates(question: str) -> tuple[str, list[str]]:
     try:
         content = chat_completion(messages, temperature=0.0, json_mode=True)
         data = json.loads(content)
-        city = str(data.get("city", "")).strip()
+        cities = data.get("cities") or data.get("city") or []
+        if isinstance(cities, str):          # 防御：模型把数组写成字符串
+            cities = [cities]
+        cities = [str(c).strip() for c in cities if str(c).strip()][:MAX_CITIES]
+        # 去重且保持顺序
+        seen: set[str] = set()
+        cities = [c for c in cities if not (c in seen or seen.add(c))]
         dates = data.get("dates") or []
         if isinstance(dates, str):
             dates = [dates]
         dates = [str(d).strip() for d in dates if str(d).strip()][:5]
-        return city, dates
+        return cities, dates
     except (RuntimeError, json.JSONDecodeError, ValueError):
-        return question.strip()[:20], []
+        return [question.strip()[:20]], []
 
 
 def answer(question: str, history: list[dict]) -> str:
     """主入口：先判断用户是否问到具体日期，问到才拉数据并分析。
+
+    支持 1~3 个城市并发查询（如「北京上海广州这周六天气怎么样」）。
 
     Args:
         question: 用户输入。
@@ -415,20 +464,25 @@ def answer(question: str, history: list[dict]) -> str:
     Returns:
         大模型的分析与建议文本；未问到日期时返回追问。
     """
-    city_name, dates = extract_city_and_dates(question)
-    if not city_name:
+    cities, dates = extract_cities_and_dates(question)
+    if not cities:
         return "你想查哪个城市的天气呢？告诉我城市名和具体日期，比如「北京这周六天气怎么样」。"
 
+    cities_text = "、".join(cities)
     if not dates:
         # 用户没有问到具体日期：不查数据、不分析，引导他说出日期
         return (
-            f"好的，{city_name}。你想了解哪一天（或哪几天）的天气呢？"
+            f"好的，{cities_text}。你想了解哪一天（或哪几天）的天气呢？"
             "可以直接说「明天」「这周六」或具体日期，"
             "我能查过去 5 天到未来 7 天的天气。"
         )
 
-    report = build_report(city_name)
-    data_text = report.to_prompt_text()
+    # 多城市并发拉数据（异步事件循环在这里驱动）
+    reports = asyncio.run(build_reports_async(cities))
+    if not reports:
+        return f"抱歉，{cities_text} 的天气数据都查不到，请检查城市名后重试。"
+
+    data_text = "\n\n".join(r.to_prompt_text() for r in reports)
     dates_text = "、".join(dates)
 
     messages: list[dict] = [{"role": "system", "content": ANALYST_SYSTEM_PROMPT}]
@@ -437,8 +491,9 @@ def answer(question: str, history: list[dict]) -> str:
         "role": "user",
         "content": (
             f"我的问题：{question}\n\n"
-            f"请重点回答 {dates_text} 的天气情况。"
-            f"\n\n该城市天气原始数据：\n{data_text}"
+            f"请重点回答 {dates_text} 的天气情况"
+            f"（涉及城市：{'、'.join(r.city.name for r in reports)}）。"
+            f"\n\n各城市天气原始数据：\n{data_text}"
         ),
     })
     reply = chat_completion(messages)
@@ -483,18 +538,18 @@ PAGE_HTML = """<!DOCTYPE html>
 <body>
 <div class="side">
   <h1>天气智能助手</h1>
-  <p>过去 5 天 + 未来 7 天<br>天气分析 & 出行建议</p>
+  <p>过去 5 天 + 未来 7 天<br>天气分析 & 出行建议<br>支持一次问 3 个城市</p>
   <div class="tips">
     试试这样问（记得带上日期）：<br>
     · 北京这周六天气怎么样<br>
     · 上海明天适合出去玩吗<br>
-    · 广州 11 月 8 日要不要带伞<br>
+    · 北京上海广州这周六哪个适合出游<br>
     · 成都昨天冷不冷
   </div>
 </div>
 <div class="chat">
   <div class="log" id="log">
-    <div class="bubble bot">你好！我是天气智能助手。告诉我城市 + 具体日期（如「北京这周六天气怎么样」），我会查询过去 5 天到未来 7 天的数据，重点回答你问的那一天。</div>
+    <div class="bubble bot">你好！我是天气智能助手。告诉我城市 + 具体日期（如「北京这周六天气怎么样」），我会查询过去 5 天到未来 7 天的数据，重点回答你问的那一天。一次最多可以同时问 3 个城市（如「北京上海广州这周六哪个适合出游」）。</div>
   </div>
   <div class="inputbar">
     <input id="q" placeholder="输入城市或问题，回车发送" autofocus>
