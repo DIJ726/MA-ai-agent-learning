@@ -37,16 +37,41 @@ HISTORY_DAYS = 5   # 过去 5 天
 FORECAST_DAYS = 7  # 未来 7 天
 MAX_HISTORY_TURNS = 20  # 多轮对话保留的最大轮数
 MAX_CITIES = 3     # 单次最多同时查询 3 个城市
+JSON_RETRY_ATTEMPTS = 3  # 结构化输出解析失败的重试次数
 
-# 千问系统提示词：让模型知道自己的数据来源和输出风格
+# 千问分析提示词：强制模型只输出固定结构的 JSON（结构化输出）
 ANALYST_SYSTEM_PROMPT = (
     "你是一名贴心的天气助理。用户会给你一个或多个城市（最多 3 个）的天气原始数据"
-    "（过去若干天历史 + 未来若干天预报 + 实时空气质量），"
-    "并指定他关心的具体日期。请用中文回答，**重点回答用户指定的那几天**："
-    "每个城市分别给出当日天气（晴雨、温度范围、风），多城市时做简短横向对比"
-    "（哪个更暖/更可能下雨/更适合出行），"
-    "以及针对那几天的出行建议（穿衣、雨具、户外活动、空气敏感人群注意事项）。"
-    "语气自然简洁，不要把每个城市 12 天数据全部罗列一遍。"
+    "（过去若干天历史 + 未来若干天预报 + 实时空气质量），并指定他关心的具体日期。"
+    "你必须只输出一个 JSON 对象，不要输出任何解释文字、markdown 代码块标记。"
+    "JSON 结构固定如下：\n"
+    '{\n'
+    '  "overview": "一句话总体概览（必填）",\n'
+    '  "days": [\n'
+    '    {\n'
+    '      "date": "yyyy-MM-dd（用户问的日期，必填）",\n'
+    '      "cities": [\n'
+    '        {\n'
+    '          "city": "城市名",\n'
+    '          "weather": "天气现象，如 小雨",\n'
+    '          "temp": "温度范围，如 1~6℃",\n'
+    '          "wind": "风向风力，如 北风3级",\n'
+    '          "suitability": "适合出行的简短结论，如 很适合/一般/不建议",\n'
+    '          "comment": "一句话点评（穿衣、雨具、注意事项）"\n'
+    '        }\n'
+    '      ]\n'
+    '    }\n'
+    '  ],\n'
+    '  "advice": {\n'
+    '    "clothing": "穿衣建议",\n'
+    '    "gear": "随身物品建议（雨具/防晒等）",\n'
+    '    "activity": "户外活动安排建议",\n'
+    '    "air": "空气敏感人群注意事项"\n'
+    '  }\n'
+    '}\n'
+    "要求：days 数组覆盖用户问的每个日期，每个日期下 cities 覆盖每个查询的城市；"
+    "所有字段都是字符串，内容用中文，简短自然；"
+    "多城市时在 comment 或 overview 里体现对比（哪个更适合出行）。"
 )
 
 # 提取城市（可多个）+ 具体日期的系统提示词
@@ -131,6 +156,97 @@ class WeatherReport:
         if self.air:
             lines.append(self.air.to_line())
         return "\n".join(lines)
+
+
+@dataclass
+class CityAnswer:
+    """单城市单日的结论文本（来自大模型 JSON 输出）。"""
+
+    city: str
+    weather: str
+    temp: str
+    wind: str
+    suitability: str
+    comment: str
+
+
+@dataclass
+class DayAnswer:
+    """单日期（含多个城市）的结论文本。"""
+
+    date: str
+    cities: list[CityAnswer] = field(default_factory=list)
+
+
+@dataclass
+class AnswerReport:
+    """大模型结构化回答的完整数据包。
+
+    overview: 一句话概览；days: 逐日期逐城市结论；advice: 出行建议四件套。
+    """
+
+    overview: str = ""
+    days: list[DayAnswer] = field(default_factory=list)
+    clothing: str = ""
+    gear: str = ""
+    activity: str = ""
+    air: str = ""
+
+
+def parse_answer_json(raw: str) -> AnswerReport:
+    """把大模型返回的 JSON 文本解析成 AnswerReport。
+
+    做了三层防御：剥掉可能的 markdown 代码块围栏、字段缺省填空字符串、
+    类型不符的列表字段自动包装。
+
+    Raises:
+        json.JSONDecodeError: raw 不是合法 JSON。
+        ValueError: JSON 结构对不上（如 days 不是列表）。
+    """
+    text = raw.strip()
+    if text.startswith("```"):  # 剥掉 ```json ... ``` 围栏
+        text = text.strip("`").lstrip("json").strip()
+    data = json.loads(text)
+    if not isinstance(data, dict):
+        raise ValueError(f"回答 JSON 顶层应是对象，实际是 {type(data).__name__}")
+
+    def as_str(value: Any) -> str:
+        return str(value).strip() if value is not None else ""
+
+    report = AnswerReport(overview=as_str(data.get("overview")))
+    days = data.get("days") or []
+    if isinstance(days, dict):
+        days = [days]
+    for day_item in days:
+        if not isinstance(day_item, dict):
+            continue
+        cities = day_item.get("cities") or []
+        if isinstance(cities, dict):
+            cities = [cities]
+        day = DayAnswer(date=as_str(day_item.get("date")))
+        for c in cities:
+            if not isinstance(c, dict):
+                continue
+            day.cities.append(CityAnswer(
+                city=as_str(c.get("city")),
+                weather=as_str(c.get("weather")),
+                temp=as_str(c.get("temp")),
+                wind=as_str(c.get("wind")),
+                suitability=as_str(c.get("suitability")),
+                comment=as_str(c.get("comment")),
+            ))
+        if day.date or day.cities:
+            report.days.append(day)
+    advice = data.get("advice") or {}
+    if isinstance(advice, str):
+        advice = {"clothing": advice}
+    report.clothing = as_str(advice.get("clothing"))
+    report.gear = as_str(advice.get("gear"))
+    report.activity = as_str(advice.get("activity"))
+    report.air = as_str(advice.get("air"))
+    if not report.overview and not report.days:
+        raise ValueError("回答 JSON 既无 overview 也无 days，视为无效")
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -452,21 +568,29 @@ def extract_cities_and_dates(question: str) -> tuple[list[str], list[str]]:
         return [question.strip()[:20]], []
 
 
-def answer(question: str, history: list[dict]) -> str:
+def answer(question: str, history: list[dict]) -> tuple[str, Optional[dict]]:
     """主入口：先判断用户是否问到具体日期，问到才拉数据并分析。
 
-    支持 1~3 个城市并发查询（如「北京上海广州这周六天气怎么样」）。
+    支持 1~3 个城市并发查询。分析阶段用 JSON 模式让模型固定输出结构化
+    结果；JSON 解析失败会重试，仍失败则降级为自然语言回复。
 
     Args:
         question: 用户输入。
         history: 对话历史（OpenAI 消息格式，会被截断到最近几轮）。
 
     Returns:
-        大模型的分析与建议文本；未问到日期时返回追问。
+        (纯文本回复, 结构化 JSON dict 或 None)。
+        追问/报错场景 JSON 为 None。
     """
+    def done(text: str, structured: Optional[dict] = None) -> tuple[str, Optional[dict]]:
+        history.append({"role": "user", "content": question})
+        history.append({"role": "assistant", "content": text})
+        return text, structured
+
     cities, dates = extract_cities_and_dates(question)
     if not cities:
-        return "你想查哪个城市的天气呢？告诉我城市名和具体日期，比如「北京这周六天气怎么样」。"
+        return ("你想查哪个城市的天气呢？告诉我城市名和具体日期，"
+                "比如「北京这周六天气怎么样」。", None)
 
     cities_text = "、".join(cities)
     if not dates:
@@ -474,13 +598,13 @@ def answer(question: str, history: list[dict]) -> str:
         return (
             f"好的，{cities_text}。你想了解哪一天（或哪几天）的天气呢？"
             "可以直接说「明天」「这周六」或具体日期，"
-            "我能查过去 5 天到未来 7 天的天气。"
+            "我能查过去 5 天到未来 7 天的天气。", None
         )
 
     # 多城市并发拉数据（异步事件循环在这里驱动）
     reports = asyncio.run(build_reports_async(cities))
     if not reports:
-        return f"抱歉，{cities_text} 的天气数据都查不到，请检查城市名后重试。"
+        return (f"抱歉，{cities_text} 的天气数据都查不到，请检查城市名后重试。", None)
 
     data_text = "\n\n".join(r.to_prompt_text() for r in reports)
     dates_text = "、".join(dates)
@@ -496,10 +620,74 @@ def answer(question: str, history: list[dict]) -> str:
             f"\n\n各城市天气原始数据：\n{data_text}"
         ),
     })
-    reply = chat_completion(messages)
-    history.append({"role": "user", "content": question})
-    history.append({"role": "assistant", "content": reply})
-    return reply
+
+    # 第一步：JSON 模式请求，失败自动重试，仍失败降级纯文本
+    report: Optional[AnswerReport] = None
+    last_error: Optional[Exception] = None
+    for _ in range(JSON_RETRY_ATTEMPTS):
+        try:
+            raw = chat_completion(messages, json_mode=True)
+            report = parse_answer_json(raw)
+            break
+        except (RuntimeError, json.JSONDecodeError, ValueError) as exc:
+            last_error = exc
+            print(f"[重试] 结构化输出解析失败: {exc}")
+    if report is None:
+        print(f"[降级] 结构化输出不可用，改用自然语言回复（{last_error}）")
+        text = chat_completion(messages)
+        return done(text)
+
+    # 第二步：结构化结果 → 渲染纯文本（给历史和降级显示用）+ JSON（给前端）
+    structured = report_to_dict(report)
+    return done(report_to_plain_text(report), structured)
+
+
+def report_to_dict(report: AnswerReport) -> dict:
+    """把 AnswerReport 转成给前端的 JSON dict。"""
+    return {
+        "overview": report.overview,
+        "days": [
+            {
+                "date": d.date,
+                "cities": [
+                    {
+                        "city": c.city, "weather": c.weather, "temp": c.temp,
+                        "wind": c.wind, "suitability": c.suitability,
+                        "comment": c.comment,
+                    }
+                    for c in d.cities
+                ],
+            }
+            for d in report.days
+        ],
+        "advice": {
+            "clothing": report.clothing, "gear": report.gear,
+            "activity": report.activity, "air": report.air,
+        },
+    }
+
+
+def report_to_plain_text(report: AnswerReport) -> str:
+    """把结构化结果渲染成可读纯文本（存进对话历史，多轮追问用）。"""
+    lines = [f"概览：{report.overview}"] if report.overview else []
+    for day in report.days:
+        lines.append(f"\n【{day.date}】")
+        for c in day.cities:
+            lines.append(
+                f"{c.city}：{c.weather}，{c.temp}，{c.wind}，"
+                f"出行 {c.suitability}。{c.comment}"
+            )
+    advice = [f"\n建议："]
+    if report.clothing:
+        advice.append(f"- 穿衣：{report.clothing}")
+    if report.gear:
+        advice.append(f"- 随身：{report.gear}")
+    if report.activity:
+        advice.append(f"- 活动：{report.activity}")
+    if report.air:
+        advice.append(f"- 空气：{report.air}")
+    lines.extend(advice)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -525,6 +713,15 @@ PAGE_HTML = """<!DOCTYPE html>
   .user { background: #2c5f8a; color: #fff; margin-left: auto; }
   .bot { background: #fff; color: #222; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
   .bot.pending { color: #999; font-style: italic; }
+  .card { padding: 16px 20px; }
+  .card-overview { font-weight: bold; font-size: 15px; margin-bottom: 10px; line-height: 1.6; }
+  .card-date { font-weight: bold; color: #2c5f8a; margin: 12px 0 6px; font-size: 14px; }
+  .card-table { border-collapse: collapse; width: 100%; font-size: 13px; white-space: normal; }
+  .card-table th, .card-table td { border: 1px solid #dfe6ee; padding: 6px 10px; text-align: left; }
+  .card-table th { background: #f0f5fa; color: #2c5f8a; }
+  .card-table td.good { color: #1a7f37; font-weight: bold; }
+  .card-table td.bad { color: #c0392b; font-weight: bold; }
+  .card-advice { font-size: 13px; line-height: 1.9; color: #333; }
   .inputbar { display: flex; gap: 10px; padding: 16px 32px; background: #fff;
               border-top: 1px solid #e3e8ee; }
   .inputbar input { flex: 1; font-size: 15px; padding: 12px 16px; border: 1px solid #cfd8e3;
@@ -570,6 +767,55 @@ function addBubble(cls, text) {
   return div;
 }
 
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+
+/* 把后端返回的结构化 JSON 渲染成卡片 */
+function renderCard(pending, data) {
+  pending.className = 'bubble bot card';
+  pending.textContent = '';
+  const box = pending;
+
+  if (data.overview) {
+    box.appendChild(el('div', 'card-overview', data.overview));
+  }
+  for (const day of (data.days || [])) {
+    if (day.date) box.appendChild(el('div', 'card-date', '📅 ' + day.date));
+    const table = el('table', 'card-table');
+    const head = el('tr');
+    ['城市', '天气', '温度', '出行', '点评'].forEach(t => head.appendChild(el('th', '', t)));
+    table.appendChild(head);
+    for (const c of (day.cities || [])) {
+      const row = el('tr');
+      row.appendChild(el('td', '', c.city));
+      row.appendChild(el('td', '', c.weather));
+      row.appendChild(el('td', '', c.temp));
+      const suit = el('td', '', c.suitability);
+      if (c.suitability && c.suitability.indexOf('不建议') >= 0) suit.classList.add('bad');
+      else if (c.suitability && c.suitability.indexOf('适合') >= 0) suit.classList.add('good');
+      row.appendChild(suit);
+      row.appendChild(el('td', '', c.comment));
+      table.appendChild(row);
+    }
+    box.appendChild(table);
+  }
+  const advice = data.advice || {};
+  const items = [['👕 穿衣', advice.clothing], ['🎒 随身', advice.gear],
+                 ['🚶 活动', advice.activity], ['🌿 空气', advice.air]];
+  const useful = items.filter(it => it[1]);
+  if (useful.length) {
+    box.appendChild(el('div', 'card-date', '出行建议'));
+    for (const [label, val] of useful) {
+      box.appendChild(el('div', 'card-advice', label + '：' + val));
+    }
+  }
+  log.scrollTop = log.scrollHeight;
+}
+
 async function ask() {
   const text = q.value.trim();
   if (!text) return;
@@ -584,8 +830,15 @@ async function ask() {
       body: JSON.stringify({message: text})
     });
     const data = await resp.json();
-    pending.className = 'bubble bot';
-    pending.textContent = data.reply || data.error || '（空回复）';
+    if (data.error) {
+      pending.className = 'bubble bot';
+      pending.textContent = data.error;
+    } else if (data.reply_json) {
+      renderCard(pending, data.reply_json);
+    } else {
+      pending.className = 'bubble bot';
+      pending.textContent = data.reply || '（空回复）';
+    }
   } catch (err) {
     pending.className = 'bubble bot';
     pending.textContent = '请求失败：' + err.message;
@@ -628,11 +881,14 @@ class ChatHandler(BaseHTTPRequestHandler):
         payload = json.loads(self.rfile.read(length) or b"{}")
         message = str(payload.get("message", "")).strip()
 
-        result: dict[str, str] = {}
+        result: dict[str, Any] = {}
         try:
             if not message:
                 raise RuntimeError("请输入内容")
-            result["reply"] = answer(message, ChatHandler.conversation)
+            text, structured = answer(message, ChatHandler.conversation)
+            result["reply"] = text
+            if structured:
+                result["reply_json"] = structured
         except Exception as exc:  # 对话接口兜底：出错也返回可读信息
             result["error"] = f"出错了：{exc}"
 
