@@ -22,7 +22,14 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 import httpx
-import requests
+
+from chat_with_llm import (
+    DASHSCOPE_KEY,
+    chat_completion,
+    load_env,
+    retry,
+    timed,
+)
 
 # ---------------------------------------------------------------------------
 # 常量配置
@@ -31,8 +38,6 @@ ENV_FILE_PATH = Path(__file__).resolve().parent / ".env"
 SERVER_HOST = "127.0.0.1"
 SERVER_PORT = 8765
 REQUEST_TIMEOUT_SECONDS = 30
-LLM_MODEL_NAME = "qwen-plus"
-LLM_BASE_URL = "https://ws-ljhpruzo85ykejwp.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
 HISTORY_DAYS = 5   # 过去 5 天
 FORECAST_DAYS = 7  # 未来 7 天
 MAX_HISTORY_TURNS = 20  # 多轮对话保留的最大轮数
@@ -252,39 +257,10 @@ def parse_answer_json(raw: str) -> AnswerReport:
 # ---------------------------------------------------------------------------
 # 装饰器：通用能力增强
 # ---------------------------------------------------------------------------
-def retry(attempts: int = 3, delay: float = 1.0) -> Callable:
-    """自动重试装饰器：网络抖动时最多重试 attempts 次。"""
-
-    def decorator(func: Callable) -> Callable:
-        @wraps(func)
-        def wrapper(*args: Any, **kwargs: Any) -> Any:
-            last_exc: Optional[Exception] = None
-            for _ in range(attempts):
-                try:
-                    return func(*args, **kwargs)
-                except (requests.RequestException, RuntimeError) as exc:
-                    last_exc = exc
-                    time.sleep(delay)
-            raise RuntimeError(f"{func.__name__} 重试 {attempts} 次仍失败: {last_exc}") from last_exc
-
-        return wrapper
-
-    return decorator
-
-
-def timed(func: Callable) -> Callable:
-    """计时装饰器：打印每次调用耗时（调试性能用）。"""
-
-    @wraps(func)
-    def wrapper(*args: Any, **kwargs: Any) -> Any:
-        start = time.time()
-        result = func(*args, **kwargs)
-        print(f"[耗时] {func.__name__}: {time.time() - start:.1f}s")
-        return result
-
-    return wrapper
-
-
+# ---------------------------------------------------------------------------
+# 装饰器：ttl_cache（和风天气接口结果缓存）
+# retry / timed 已抽到 chat_with_llm.py，从那里 import
+# ---------------------------------------------------------------------------
 def ttl_cache(seconds: int = 600) -> Callable:
     """简单缓存装饰器：相同城市 10 分钟内不重复请求和风 API。"""
 
@@ -307,27 +283,9 @@ def ttl_cache(seconds: int = 600) -> Callable:
 
 
 # ---------------------------------------------------------------------------
-# 密钥与基础请求
+# 和风天气密钥（千问密钥已由 chat_with_llm 加载）
 # ---------------------------------------------------------------------------
-def load_env(env_file: Path = ENV_FILE_PATH) -> dict[str, str]:
-    """读取 .env 文件为字典。
-
-    Raises:
-        FileNotFoundError: .env 不存在。
-    """
-    if not env_file.exists():
-        raise FileNotFoundError(f"未找到配置文件: {env_file}")
-    config: dict[str, str] = {}
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, _, value = line.partition("=")
-            config[key.strip()] = value.strip()
-    return config
-
-
 ENV = load_env()
-DASHSCOPE_KEY = ENV.get("DASHSCOPE_API_KEY", "")
 QW_KEY = ENV.get("QWEATHER_API_KEY", "")
 QW_HOST = ENV.get("QWEATHER_API_HOST", "")
 
@@ -370,45 +328,7 @@ async def qweather_get_async(path: str, params: dict[str, str],
     return data
 
 
-def chat_completion(messages: list[dict], temperature: float = 0.7,
-                    json_mode: bool = False) -> str:
-    """调用千问大模型，返回回复文本。
-
-    Args:
-        messages: OpenAI 格式消息列表。
-        temperature: 采样温度。
-        json_mode: True 时强制返回 JSON（用于城市提取）。
-
-    Raises:
-        RuntimeError: 调用失败或返回格式异常。
-    """
-    headers = {
-        "Authorization": f"Bearer {DASHSCOPE_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload: dict[str, Any] = {
-        "model": LLM_MODEL_NAME,
-        "messages": messages,
-        "temperature": temperature,
-    }
-    if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-
-    try:
-        resp = requests.post(
-            f"{LLM_BASE_URL}/chat/completions",
-            headers=headers,
-            json=payload,
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"千问 API 请求失败: {exc}") from exc
-
-    try:
-        return resp.json()["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
-        raise RuntimeError(f"千问 API 返回格式异常: {resp.text[:200]}") from exc
+# chat_completion 已从 chat_with_llm 导入，这里不再重复定义。
 
 
 # ---------------------------------------------------------------------------
