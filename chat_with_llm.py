@@ -111,19 +111,10 @@ DASHSCOPE_KEY = _ENV.get("DASHSCOPE_API_KEY", "")
 # 底层：chat completion
 # ---------------------------------------------------------------------------
 @retry(attempts=3, delay=1.0)
-def chat_completion(messages: list[dict],
-                    temperature: float = 0.7,
-                    json_mode: bool = False) -> str:
-    """调用千问大模型，返回回复文本。
-
-    Args:
-        messages: OpenAI 格式消息列表 [{"role": "...", "content": "..."}]。
-        temperature: 采样温度，0=确定，1=发散。
-        json_mode: True 时强制返回 JSON（response_format=json_object）。
-
-    Raises:
-        RuntimeError: 调用失败或返回格式异常（已由 retry 装饰器重试过 3 次）。
-    """
+def _do_chat_request(messages: list[dict],
+                     temperature: float = 0.7,
+                     json_mode: bool = False) -> tuple[str, dict]:
+    """底层 HTTP 调用，返回 (回复文本, usage 字典)。不直接对外。"""
     headers = {
         "Authorization": f"Bearer {DASHSCOPE_KEY}",
         "Content-Type": "application/json",
@@ -144,10 +135,45 @@ def chat_completion(messages: list[dict],
     )
     resp.raise_for_status()
 
+    body = resp.json()
     try:
-        return resp.json()["choices"][0]["message"]["content"]
+        content = body["choices"][0]["message"]["content"]
     except (KeyError, IndexError) as exc:
         raise RuntimeError(f"千问 API 返回格式异常: {resp.text[:200]}") from exc
+
+    usage = body.get("usage") or {}
+    return content, usage
+
+
+def chat_with_usage(messages: list[dict],
+                    temperature: float = 0.7,
+                    json_mode: bool = False) -> tuple[str, dict]:
+    """和 chat_completion 一样，但同时返回 token usage 字典。
+
+    Returns:
+        (content, usage):
+        content 是模型回复文本；
+        usage 形如 {"prompt_tokens": 123, "completion_tokens": 45, "total_tokens": 168}。
+        没拿到 usage 时返回空 dict。
+    """
+    return _do_chat_request(messages, temperature, json_mode)
+
+
+def chat_completion(messages: list[dict],
+                    temperature: float = 0.7,
+                    json_mode: bool = False) -> str:
+    """调用千问大模型，返回回复文本（不关心 usage 时用这个）。
+
+    Args:
+        messages: OpenAI 格式消息列表 [{"role": "...", "content": "..."}]。
+        temperature: 采样温度，0=确定，1=发散。
+        json_mode: True 时强制返回 JSON（response_format=json_object）。
+
+    Raises:
+        RuntimeError: 调用失败或返回格式异常（已由 retry 装饰器重试过 3 次）。
+    """
+    content, _usage = _do_chat_request(messages, temperature, json_mode)
+    return content
 
 
 # ---------------------------------------------------------------------------
