@@ -176,6 +176,56 @@ def chat_completion(messages: list[dict],
     return content
 
 
+def chat_stream(messages: list[dict],
+                temperature: float = 0.7):
+    """流式调用千问大模型，逐段 yield 回复文本（SSE）。
+
+    用法：
+        for chunk in chat_stream(messages):
+            print(chunk, end="", flush=True)
+
+    Yields:
+        str: 模型输出的一小段文本（delta），按 SSE 顺序到达。
+    """
+    headers = {
+        "Authorization": f"Bearer {DASHSCOPE_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload: dict[str, Any] = {
+        "model": LLM_MODEL_NAME,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": True,
+    }
+
+    resp = requests.post(
+        f"{LLM_BASE_URL}/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=REQUEST_TIMEOUT_SECONDS,
+        stream=True,
+    )
+    resp.raise_for_status()
+
+    for raw_line in resp.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data_str = line[len("data:"):].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+            delta = chunk["choices"][0].get("delta", {})
+            text = delta.get("content")
+            if text:
+                yield text
+        except (json.JSONDecodeError, KeyError, IndexError):
+            continue
+
+
 # ---------------------------------------------------------------------------
 # 高层：要 JSON 时的一站式调用（含重试 + 降级）
 # ---------------------------------------------------------------------------
