@@ -11,14 +11,11 @@
 
 import sys
 
-from chat_with_llm import chat_stream
-
-
-HISTORY_LIMIT = 20  # 最多保留的对话轮数（和网页版一致）
+from chat_with_llm import Conversation, chat_stream
 
 
 def main() -> None:
-    history: list[dict] = []
+    conv = Conversation(system_prompt="你是一个简洁友好的中文助手。", max_turns=20)
     print("=== 流式对话终端（输入 exit 退出）===\n")
 
     while True:
@@ -32,25 +29,22 @@ def main() -> None:
             print("再见！")
             break
 
-        history.append({"role": "user", "content": question})
-        # 截断历史，避免上下文无限变长
-        messages = [{"role": "system", "content": "你是一个简洁友好的中文助手。"}]
-        messages.extend(history[-HISTORY_LIMIT:])
+        conv.add_user(question)
 
         print("助手：", end="", flush=True)
         answer_parts: list[str] = []
         try:
-            for chunk in chat_stream(messages, temperature=0.7):
+            for chunk in chat_stream(conv.to_messages(), temperature=0.7):
                 answer_parts.append(chunk)
                 sys.stdout.write(chunk)
                 sys.stdout.flush()
         except Exception as exc:  # 终端演示：出错不崩，打印原因后回到输入
             print(f"\n[调用失败] {exc}")
-            history.pop()  # 失败的这轮不进历史
+            conv.pop_last()  # 失败的这轮不进历史
             continue
 
         print("\n")
-        history.append({"role": "assistant", "content": "".join(answer_parts)})
+        conv.add_assistant("".join(answer_parts))
 
 
 if __name__ == "__main__":

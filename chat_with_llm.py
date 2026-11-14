@@ -272,6 +272,56 @@ def chat_json(messages: list[dict],
 
 
 # ---------------------------------------------------------------------------
+# 多轮对话历史管理（周四产物）
+# ---------------------------------------------------------------------------
+class Conversation:
+    """多轮对话历史：system 置顶 + user/assistant 成对 + 滑动窗口截断。
+
+    用法：
+        conv = Conversation(system_prompt="你是助手", max_turns=20)
+        conv.add_user("北京天气")
+        reply, _ = chat_with_usage(conv.to_messages())
+        conv.add_assistant(reply)
+        next_reply = chat_completion(conv.to_messages())
+
+    截断规则：只保留最近 max_turns 轮（一轮 = user + assistant 两条）；
+    若截断后第一条是 assistant，丢掉它，保证消息序列仍从 user 开始。
+    """
+
+    def __init__(self, system_prompt: str = "", max_turns: int = 20) -> None:
+        self.system_prompt = system_prompt
+        self.max_turns = max_turns
+        self._history: list[dict] = []
+
+    def add_user(self, content: str) -> None:
+        self._history.append({"role": "user", "content": content})
+
+    def add_assistant(self, content: str) -> None:
+        self._history.append({"role": "assistant", "content": content})
+
+    def pop_last(self) -> Optional[dict]:
+        """撤回最后一条历史（API 调用失败时用，避免留下没有回答的 user 消息）。"""
+        return self._history.pop() if self._history else None
+
+    def to_messages(self) -> list[dict]:
+        """组装成 OpenAI 格式消息列表：system 在前，后跟截断后的历史。"""
+        recent = self._history[-2 * self.max_turns:]
+        if recent and recent[0]["role"] == "assistant":
+            recent = recent[1:]
+        messages: list[dict] = []
+        if self.system_prompt:
+            messages.append({"role": "system", "content": self.system_prompt})
+        messages.extend(recent)
+        return messages
+
+    def __len__(self) -> int:
+        return len(self._history)
+
+    def clear(self) -> None:
+        self._history.clear()
+
+
+# ---------------------------------------------------------------------------
 # 直接运行时自测：python chat_with_llm.py
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
