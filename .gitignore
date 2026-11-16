@@ -1,4 +1,5 @@
 # 防止密钥文件被提交到 Git
 .env
+.env.bak*
 __pycache__/
 *.pyc

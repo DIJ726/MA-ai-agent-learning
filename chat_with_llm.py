@@ -40,7 +40,7 @@ import requests
 # ---------------------------------------------------------------------------
 ENV_FILE_PATH = Path(__file__).resolve().parent / ".env"
 LLM_MODEL_NAME = "qwen-plus"
-LLM_BASE_URL = "https://ws-ljhpruzo85ykejwp.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+LLM_BASE_URL = "https://maas.qianwenaiapi.com/compatible-mode/v1"
 REQUEST_TIMEOUT_SECONDS = 30
 DEFAULT_JSON_RETRIES = 3
 
