@@ -1,0 +1,271 @@
+"""min_agent.py — 最小 ReAct Agent 骨架（第 3 周周二产物）。
+
+今天只做两件事（对应计划：ReAct 范式 Thought→Action→Observation；Thought/Action 解析）：
+  1. 解析模型按 ReAct 格式输出的一步推理：Thought / Action / Action Input / Final Answer
+  2. 搭出 ReAct 循环骨架：思考 → 行动（桩）→ 观察回填 → 再思考，直到 Final Answer
+
+后续任务分工（本周排期，不在今天实现）：
+  - 周三：定义真实工具（计算器、时间查询）
+  - 周四：工具注册与路由，替换掉今天的 _execute_action 桩
+  - 周五：给 Agent 加独立记忆字典
+  - 周六：接真实 LLM 端到端跑通并调试
+
+ReAct 输出格式（由 system prompt 约束模型遵守）：
+
+    Thought: <分析现状，推理下一步>
+    Action: <工具名>
+    Action Input: <JSON 参数，例如 {"expression": "128 * 46"}>
+
+信息足够时直接终止：
+
+    Thought: <确认信息已足够>
+    Final Answer: <最终回答>
+
+Observation 由 Agent 在工具执行后回填，模型不需要输出。
+
+离线自测：python min_agent.py（用假 LLM 脚本跑循环，不消耗真实 token）。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+from chat_with_llm import chat_completion
+
+# ---------------------------------------------------------------------------
+# 常量
+# ---------------------------------------------------------------------------
+DEFAULT_MAX_STEPS = 5  # 循环上限，防止 Agent 死循环
+
+DEFAULT_SYSTEM_PROMPT = (
+    "你是一个使用 ReAct（思考-行动-观察）范式工作的 Agent。严格按下面的格式逐轮输出，一轮只做一个动作：\n"
+    "\n"
+    "Thought: 分析当前已知信息，推理下一步该做什么。\n"
+    "Action: 工具名。\n"
+    "Action Input: 给该工具的 JSON 参数，例如 {\"expression\": \"128 * 46\"}。\n"
+    "\n"
+    "如果信息已经足够回答用户，不要再调用工具，改用：\n"
+    "Thought: 确认信息已足够。\n"
+    "Final Answer: 最终回答。\n"
+    "\n"
+    "注意：Observation（工具返回结果）由系统自动回填，你不要写。"
+)
+
+# 已知标记：用于在文本里定位各字段边界
+_NEXT_FIELD = "Action Input|Action|Observation|Final Answer"
+
+
+# ---------------------------------------------------------------------------
+# 数据结构：一步 ReAct 推理
+# ---------------------------------------------------------------------------
+@dataclass
+class ReActStep:
+    """模型一轮输出解析后的结构化结果。
+
+    属性:
+        thought: 思考内容；缺失为 None。
+        action: 工具名；Final Answer 步骤为 None。
+        action_input: 解析后的参数 dict；解析失败时保留 {"_raw": 原始文本}。
+        observation: 工具执行结果（由 _execute_action 回填）。
+        final_answer: 最终回答；非 None 表示本轮应终止循环。
+        raw: 模型原始文本。
+    """
+
+    thought: Optional[str] = None
+    action: Optional[str] = None
+    action_input: Optional[dict] = None
+    observation: Optional[str] = None
+    final_answer: Optional[str] = None
+    raw: str = ""
+
+    @property
+    def is_final(self) -> bool:
+        """是否已给出 Final Answer（循环终止信号）。"""
+        return self.final_answer is not None
+
+
+# ---------------------------------------------------------------------------
+# 解析工具函数
+# ---------------------------------------------------------------------------
+def _extract_field(text: str, label: str) -> Optional[str]:
+    """提取 ``Label: 内容`` 字段，内容取到下一个已知标记或文本结束为止。"""
+    pattern = re.compile(
+        rf"{label}\s*:\s*(.*?)(?=\n(?:{_NEXT_FIELD})\s*:|$)",
+        re.S | re.I,
+    )
+    match = pattern.search(text)
+    return match.group(1).strip() if match else None
+
+
+def _clean_action_name(action_line: Optional[str]) -> Optional[str]:
+    """从 Action 行提取纯工具名，去掉 ``calculator(...)`` 这类括号参数。"""
+    if action_line is None:
+        return None
+    name = action_line.strip()
+    match = re.match(r"([A-Za-z0-9_]+)", name)
+    return match.group(1) if match else name
+
+
+def _parse_action_input(raw: Optional[str]) -> dict:
+    """把 Action Input 文本解析成 dict；JSON 失败时把原文放进 _raw 字段。"""
+    if not raw:
+        return {}
+    raw = raw.strip()
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {"value": data}
+    except json.JSONDecodeError:
+        return {"_raw": raw}
+
+
+def parse_react_step(text: str) -> ReActStep:
+    """把模型一轮 ReAct 输出解析成 ReActStep。
+
+    支持两种轮次：
+      - 动作轮：Thought + Action + Action Input
+      - 终止轮：Thought + Final Answer
+
+    解析不抛异常：缺字段置 None，参数 JSON 解析失败降级为 {"_raw": ...}。
+    """
+    final_answer = _extract_field(text, "Final Answer")
+    action_line = _extract_field(text, "Action")
+
+    return ReActStep(
+        thought=_extract_field(text, "Thought"),
+        action=_clean_action_name(action_line),
+        action_input=_parse_action_input(_extract_field(text, "Action Input")),
+        final_answer=final_answer,
+        raw=text.strip(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Agent 主体：ReAct 循环骨架
+# ---------------------------------------------------------------------------
+class ReActAgent:
+    """最小 ReAct Agent。
+
+    Args:
+        llm: 调用模型的函数，签名 ``llm(messages: list[dict]) -> str``。
+            默认用 chat_with_llm.chat_completion；测试时可注入假 LLM。
+        max_steps: 循环最大轮数，防止死循环。
+        system_prompt: 约束模型输出 ReAct 格式的系统提示。
+    """
+
+    def __init__(
+        self,
+        llm: Callable[[list[dict]], str] = chat_completion,
+        max_steps: int = DEFAULT_MAX_STEPS,
+        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+    ) -> None:
+        self.llm = llm
+        self.max_steps = max_steps
+        self.system_prompt = system_prompt
+        self.trajectory: list[ReActStep] = []  # 本轮任务的完整推理轨迹（周五再升级成独立记忆组件）
+
+    # -- 对外主流程 ---------------------------------------------------------
+    def run(self, question: str) -> str:
+        """跑 ReAct 循环，返回最终回答。
+
+        循环步骤：调模型 → 解析一步 → 终止则返回 → 否则执行动作（桩）→
+        把 Observation 回填进上下文，进入下一轮。
+        """
+        messages: list[dict] = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": question},
+        ]
+
+        for _ in range(self.max_steps):
+            raw = self.llm(messages)
+            step = parse_react_step(raw)
+            self.trajectory.append(step)
+
+            if step.is_final:
+                return step.final_answer or ""
+
+            # 执行动作（周四接真实工具路由；当前为占位桩）
+            step.observation = self._execute_action(step)
+
+            # 轨迹回填：模型上一轮输出 + 工具观察，作为下一轮上下文
+            messages.append({"role": "assistant", "content": raw})
+            messages.append({"role": "user", "content": f"Observation: {step.observation}"})
+
+        # 超过最大步数仍未给出 Final Answer
+        last = self.trajectory[-1] if self.trajectory else None
+        return last.thought or "达到最大循环步数，仍未给出最终答案。"
+
+    # -- 工具执行桩（周四替换为真实路由） -----------------------------------
+    def _execute_action(self, step: ReActStep) -> str:
+        """执行 Action。今天是骨架：只记录选择了哪个工具和参数，不真正调用。
+
+        周三定义计算器/时间查询工具，周四注册并路由到这里。
+        """
+        return (
+            f"[骨架占位] 工具={step.action}，参数={step.action_input}；"
+            "真实工具执行将在周四接入。"
+        )
+
+    # -- 调试辅助 -----------------------------------------------------------
+    def print_trajectory(self) -> None:
+        """打印本轮轨迹（Thought / Action / Observation），调试用。"""
+        for index, step in enumerate(self.trajectory, start=1):
+            print(f"\n--- Step {index} ---")
+            print(f"Thought: {step.thought}")
+            if step.action:
+                print(f"Action: {step.action}  Input: {step.action_input}")
+            if step.observation:
+                print(f"Observation: {step.observation}")
+            if step.is_final:
+                print(f"Final Answer: {step.final_answer}")
+
+
+# ---------------------------------------------------------------------------
+# 直接运行时离线自测：python min_agent.py
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    # 1. 解析器自测：动作轮
+    action_sample = (
+        "Thought: 需要先算乘积，心算容易错，应该调用计算器。\n"
+        "Action: calculator\n"
+        'Action Input: {"expression": "128 * 46"}'
+    )
+    parsed_action = parse_react_step(action_sample)
+    assert parsed_action.action == "calculator"
+    assert parsed_action.action_input == {"expression": "128 * 46"}
+    assert not parsed_action.is_final
+    print("解析动作轮 OK：", parsed_action.action, parsed_action.action_input)
+
+    # 2. 解析器自测：终止轮
+    final_sample = (
+        "Thought: 结果 6638 已确认，可以回答。\n"
+        "Final Answer: 128 × 46 + 750 = 6638。"
+    )
+    parsed_final = parse_react_step(final_sample)
+    assert parsed_final.is_final
+    assert "6638" in parsed_final.final_answer
+    print("解析终止轮 OK：", parsed_final.final_answer)
+
+    # 3. 循环骨架自测：注入假 LLM，按脚本依次返回「动作 → 动作 → 最终回答」
+    scripts = [
+        action_sample,
+        "Thought: 乘积是 5888，下一步加 750，继续用计算器。\n"
+        "Action: calculator\n"
+        'Action Input: {"expression": "5888 + 750"}',
+        final_sample,
+    ]
+
+    def fake_llm(_messages: list[dict]) -> str:
+        return scripts.pop(0)
+
+    agent = ReActAgent(llm=fake_llm, max_steps=5)
+    answer = agent.run("128 乘以 46，再加上 750，结果是多少？")
+
+    print("\n=== Agent 轨迹 ===")
+    agent.print_trajectory()
+    print("\n=== 最终回答 ===")
+    print(answer)
+    assert "6638" in answer
+    print("\n循环骨架自测通过。")
