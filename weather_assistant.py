@@ -6,7 +6,7 @@
 再把原始数据交给千问大模型分析，重点回答用户问的日期，并给出出行建议。
 只有用户问到具体日期才查询数据；只说城市时助手会先追问日期。
 
-运行方式：python weather_assistant.py，浏览器自动打开 http://127.0.0.1:8765
+运行方式：python weather_assistant.py，浏览器自动打开 http://127.0.0.1:8766
 密钥存放：同目录 .env 文件（DASHSCOPE_API_KEY / QWEATHER_API_KEY / QWEATHER_API_HOST）
 """
 
@@ -36,7 +36,7 @@ from chat_with_llm import (
 # ---------------------------------------------------------------------------
 ENV_FILE_PATH = Path(__file__).resolve().parent / ".env"
 SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 8765
+SERVER_PORT = 8766
 REQUEST_TIMEOUT_SECONDS = 30
 HISTORY_DAYS = 5   # 过去 5 天
 FORECAST_DAYS = 7  # 未来 7 天
