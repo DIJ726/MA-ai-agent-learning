@@ -1,0 +1,4 @@
+# 运行本项目所需第三方依赖（标准库不在此列）
+# 安装：python -m pip install -r requirements.txt
+requests>=2.31
+httpx>=0.27
