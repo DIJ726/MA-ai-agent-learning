@@ -1,14 +1,13 @@
-"""min_agent.py — 最小 ReAct Agent 骨架（第 3 周周二产物）。
+"""min_agent.py — 最小 ReAct Agent（第 3 周产物）。
 
-今天只做两件事（对应计划：ReAct 范式 Thought→Action→Observation；Thought/Action 解析）：
-  1. 解析模型按 ReAct 格式输出的一步推理：Thought / Action / Action Input / Final Answer
-  2. 搭出 ReAct 循环骨架：思考 → 行动（桩）→ 观察回填 → 再思考，直到 Final Answer
+演进记录：
+  - 周二：解析模型 ReAct 输出（Thought / Action / Action Input / Final Answer）+ 循环骨架（工具为桩）。
+  - 周四（今天）：工具注册与路由。ReActAgent 读取 tools.TOOL_REGISTRY，把模型选的工具按名
+    分派到 tools.execute_tool 真实执行，结果作为 Observation 回填。
 
 后续任务分工（本周排期，不在今天实现）：
-  - 周三：定义真实工具（计算器、时间查询）
-  - 周四：工具注册与路由，替换掉今天的 _execute_action 桩
-  - 周五：给 Agent 加独立记忆字典
-  - 周六：接真实 LLM 端到端跑通并调试
+  - 周五：给 Agent 加独立记忆字典（当前轨迹暂存在 trajectory 列表）。
+  - 周六：接真实 LLM 端到端跑通并调试。
 
 ReAct 输出格式（由 system prompt 约束模型遵守）：
 
@@ -34,6 +33,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from chat_with_llm import chat_completion
+from tools import TOOL_REGISTRY, execute_tool
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -56,6 +56,17 @@ DEFAULT_SYSTEM_PROMPT = (
 
 # 已知标记：用于在文本里定位各字段边界
 _NEXT_FIELD = "Action Input|Action|Observation|Final Answer"
+
+
+def _tools_catalog_text() -> str:
+    """从工具注册表生成给模型看的可用工具清单（名称 + 用途 + 参数）。"""
+    if not TOOL_REGISTRY:
+        return "当前没有注册任何可用工具。"
+    lines = ["可用工具（Action 必须从下列名称中选择）："]
+    for tool in TOOL_REGISTRY.values():
+        params = ", ".join(tool.parameters.get("properties", {}).keys()) or "无参数"
+        lines.append(f"- {tool.name}：{tool.description}（参数：{params}）")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -152,18 +163,22 @@ class ReActAgent:
         llm: 调用模型的函数，签名 ``llm(messages: list[dict]) -> str``。
             默认用 chat_with_llm.chat_completion；测试时可注入假 LLM。
         max_steps: 循环最大轮数，防止死循环。
-        system_prompt: 约束模型输出 ReAct 格式的系统提示。
+        system_prompt: 约束模型输出 ReAct 格式的系统提示；传 None 时自动
+            拼接基础格式说明 + 当前注册的工具清单。
     """
 
     def __init__(
         self,
         llm: Callable[[list[dict]], str] = chat_completion,
         max_steps: int = DEFAULT_MAX_STEPS,
-        system_prompt: str = DEFAULT_SYSTEM_PROMPT,
+        system_prompt: Optional[str] = None,
     ) -> None:
         self.llm = llm
         self.max_steps = max_steps
-        self.system_prompt = system_prompt
+        if system_prompt is None:
+            self.system_prompt = DEFAULT_SYSTEM_PROMPT + "\n\n" + _tools_catalog_text()
+        else:
+            self.system_prompt = system_prompt
         self.trajectory: list[ReActStep] = []  # 本轮任务的完整推理轨迹（周五再升级成独立记忆组件）
 
     # -- 对外主流程 ---------------------------------------------------------
@@ -186,7 +201,7 @@ class ReActAgent:
             if step.is_final:
                 return step.final_answer or ""
 
-            # 执行动作（周四接真实工具路由；当前为占位桩）
+            # 执行动作：按模型选择的工具名路由到注册表真实执行
             step.observation = self._execute_action(step)
 
             # 轨迹回填：模型上一轮输出 + 工具观察，作为下一轮上下文
@@ -197,16 +212,17 @@ class ReActAgent:
         last = self.trajectory[-1] if self.trajectory else None
         return last.thought or "达到最大循环步数，仍未给出最终答案。"
 
-    # -- 工具执行桩（周四替换为真实路由） -----------------------------------
+    # -- 工具路由（周四接入：注册表按名分派到真实工具） -----------------------
     def _execute_action(self, step: ReActStep) -> str:
-        """执行 Action。今天是骨架：只记录选择了哪个工具和参数，不真正调用。
+        """按 Action 里的工具名查注册表执行，返回观察文本。
 
-        周三定义计算器/时间查询工具，周四注册并路由到这里。
+        路由职责：模型决定调哪个工具（Action）和传什么参数（Action Input），
+        Agent 只负责按名找到对应工具并执行；未知工具、参数异常由
+        tools.execute_tool 兜成错误文本回传，不会中断循环。
         """
-        return (
-            f"[骨架占位] 工具={step.action}，参数={step.action_input}；"
-            "真实工具执行将在周四接入。"
-        )
+        if not step.action:
+            return "观察：本轮没有给出 Action 工具名，无法执行。"
+        return execute_tool(step.action, step.action_input or {})
 
     # -- 调试辅助 -----------------------------------------------------------
     def print_trajectory(self) -> None:
@@ -226,6 +242,8 @@ class ReActAgent:
 # 直接运行时离线自测：python min_agent.py
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+    import re as _re
+
     # 1. 解析器自测：动作轮
     action_sample = (
         "Thought: 需要先算乘积，心算容易错，应该调用计算器。\n"
@@ -248,8 +266,8 @@ if __name__ == "__main__":
     assert "6638" in parsed_final.final_answer
     print("解析终止轮 OK：", parsed_final.final_answer)
 
-    # 3. 循环骨架自测：注入假 LLM，按脚本依次返回「动作 → 动作 → 最终回答」
-    scripts = [
+    # 3. 计算器路由自测：假 LLM 脚本三步，观察必须是真实工具结果（5888 / 6638）
+    calc_scripts = [
         action_sample,
         "Thought: 乘积是 5888，下一步加 750，继续用计算器。\n"
         "Action: calculator\n"
@@ -257,15 +275,45 @@ if __name__ == "__main__":
         final_sample,
     ]
 
-    def fake_llm(_messages: list[dict]) -> str:
-        return scripts.pop(0)
+    def fake_calc_llm(_messages: list[dict]) -> str:
+        return calc_scripts.pop(0)
 
-    agent = ReActAgent(llm=fake_llm, max_steps=5)
-    answer = agent.run("128 乘以 46，再加上 750，结果是多少？")
+    calc_agent = ReActAgent(llm=fake_calc_llm, max_steps=5)
+    answer = calc_agent.run("128 乘以 46，再加上 750，结果是多少？")
 
-    print("\n=== Agent 轨迹 ===")
-    agent.print_trajectory()
-    print("\n=== 最终回答 ===")
-    print(answer)
+    print("\n=== 计算器场景轨迹 ===")
+    calc_agent.print_trajectory()
+    assert calc_agent.trajectory[0].observation == "5888"
+    assert calc_agent.trajectory[1].observation == "6638"
     assert "6638" in answer
-    print("\n循环骨架自测通过。")
+    print("计算器路由 OK：观察 =", calc_agent.trajectory[0].observation,
+          "→", calc_agent.trajectory[1].observation)
+
+    # 4. 时间工具路由自测：get_current_time 无参调用，观察为北京时间
+    time_scripts = [
+        "Thought: 用户想知道当前时间，调用时间查询工具。\n"
+        "Action: get_current_time\n"
+        "Action Input: {}",
+        "Thought: 已经拿到当前时间，可以回答。\n"
+        "Final Answer: 现在是查询到的北京时间。",
+    ]
+
+    def fake_time_llm(_messages: list[dict]) -> str:
+        return time_scripts.pop(0)
+
+    time_agent = ReActAgent(llm=fake_time_llm, max_steps=5)
+    time_answer = time_agent.run("现在几点了？")
+    time_obs = time_agent.trajectory[0].observation
+    print("\n=== 时间场景观察 ===")
+    print(time_obs)
+    assert _re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}", time_obs)
+    assert "周" in time_obs
+    print("时间工具路由 OK")
+
+    # 5. 未知工具兜底：不崩，返回错误说明观察
+    unknown_step = ReActStep(action="not_a_tool", action_input={"x": 1})
+    unknown_obs = calc_agent._execute_action(unknown_step)
+    assert "未知工具" in unknown_obs
+    print("\n未知工具兜底 OK：", unknown_obs)
+
+    print("\n工具路由自测通过。")
