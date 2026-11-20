@@ -2,11 +2,12 @@
 
 演进记录：
   - 周二：解析模型 ReAct 输出（Thought / Action / Action Input / Final Answer）+ 循环骨架（工具为桩）。
-  - 周四（今天）：工具注册与路由。ReActAgent 读取 tools.TOOL_REGISTRY，把模型选的工具按名
+  - 周四：工具注册与路由。ReActAgent 读取 tools.TOOL_REGISTRY，把模型选的工具按名
     分派到 tools.execute_tool 真实执行，结果作为 Observation 回填。
+  - 周五：接入记忆模块 memory.AgentMemory。run 前从长期记忆召回相关事实补进上下文，
+    问答写入短期对话记忆（滑动窗口，跨轮保留）。
 
 后续任务分工（本周排期，不在今天实现）：
-  - 周五：给 Agent 加独立记忆字典（当前轨迹暂存在 trajectory 列表）。
   - 周六：接真实 LLM 端到端跑通并调试。
 
 ReAct 输出格式（由 system prompt 约束模型遵守）：
@@ -33,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from chat_with_llm import chat_completion
+from memory import AgentMemory
 from tools import TOOL_REGISTRY, execute_tool
 
 # ---------------------------------------------------------------------------
@@ -165,6 +167,7 @@ class ReActAgent:
         max_steps: 循环最大轮数，防止死循环。
         system_prompt: 约束模型输出 ReAct 格式的系统提示；传 None 时自动
             拼接基础格式说明 + 当前注册的工具清单。
+        memory: 记忆门面（短期对话 + 长期事实）；传 None 时新建默认 AgentMemory。
     """
 
     def __init__(
@@ -172,6 +175,7 @@ class ReActAgent:
         llm: Callable[[list[dict]], str] = chat_completion,
         max_steps: int = DEFAULT_MAX_STEPS,
         system_prompt: Optional[str] = None,
+        memory: Optional[AgentMemory] = None,
     ) -> None:
         self.llm = llm
         self.max_steps = max_steps
@@ -179,19 +183,26 @@ class ReActAgent:
             self.system_prompt = DEFAULT_SYSTEM_PROMPT + "\n\n" + _tools_catalog_text()
         else:
             self.system_prompt = system_prompt
-        self.trajectory: list[ReActStep] = []  # 本轮任务的完整推理轨迹（周五再升级成独立记忆组件）
+        self.memory = memory or AgentMemory()
+        self.trajectory: list[ReActStep] = []  # 本轮任务的完整推理轨迹
 
     # -- 对外主流程 ---------------------------------------------------------
     def run(self, question: str) -> str:
         """跑 ReAct 循环，返回最终回答。
 
-        循环步骤：调模型 → 解析一步 → 终止则返回 → 否则执行动作（桩）→
-        把 Observation 回填进上下文，进入下一轮。
+        循环步骤：召回长期记忆 → 调模型 → 解析一步 → 终止则返回 → 否则执行动作 →
+        把 Observation 回填进上下文，进入下一轮；问答同时写入短期记忆。
         """
-        messages: list[dict] = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": question},
-        ]
+        # 长期记忆召回：把与问题相关的既有事实补进系统上下文
+        recall = self.memory.recall_relevant(question)
+        system_content = self.system_prompt
+        if recall:
+            system_content = system_content + "\n\n已知长期记忆（仅作参考，不要臆造）：\n" + recall
+
+        messages: list[dict] = [{"role": "system", "content": system_content}]
+        messages.extend(self.memory.short.to_messages())
+        messages.append({"role": "user", "content": question})
+        self.memory.short.add_user(question)
 
         for _ in range(self.max_steps):
             raw = self.llm(messages)
@@ -199,7 +210,9 @@ class ReActAgent:
             self.trajectory.append(step)
 
             if step.is_final:
-                return step.final_answer or ""
+                answer = step.final_answer or ""
+                self.memory.short.add_assistant(answer)
+                return answer
 
             # 执行动作：按模型选择的工具名路由到注册表真实执行
             step.observation = self._execute_action(step)
@@ -210,7 +223,9 @@ class ReActAgent:
 
         # 超过最大步数仍未给出 Final Answer
         last = self.trajectory[-1] if self.trajectory else None
-        return last.thought or "达到最大循环步数，仍未给出最终答案。"
+        answer = last.thought or "达到最大循环步数，仍未给出最终答案。"
+        self.memory.short.add_assistant(answer)
+        return answer
 
     # -- 工具路由（周四接入：注册表按名分派到真实工具） -----------------------
     def _execute_action(self, step: ReActStep) -> str:
@@ -315,5 +330,26 @@ if __name__ == "__main__":
     unknown_obs = calc_agent._execute_action(unknown_step)
     assert "未知工具" in unknown_obs
     print("\n未知工具兜底 OK：", unknown_obs)
+
+    # 6. 记忆接入自测：同一 Agent 连续两轮，短期历史保留；长期事实召回进上下文
+    captured: list[list[dict]] = []
+
+    def recording_llm(messages: list[dict]) -> str:
+        captured.append(messages)
+        return "Thought: 已了解。\nFinal Answer: 好的。"
+
+    mem_agent = ReActAgent(llm=recording_llm, max_steps=3)
+    mem_agent.memory.remember_fact("用户喜欢晚上学习", tags=["偏好"])
+    mem_agent.run("我平时什么时候学习？")
+    mem_agent.run("再确认一下")
+
+    assert len(mem_agent.memory.short) == 4, "两轮问答应留下 4 条短期记忆"
+    first_messages = captured[0]
+    second_messages = captured[1]
+    assert any("晚上学习" in m["content"] for m in first_messages), "长期召回应进系统上下文"
+    assert any(m["role"] == "user" and "我平时什么时候学习" in m["content"]
+               for m in second_messages), "上一轮问答应保留在短期历史"
+    print("\n记忆接入 OK：短期", len(mem_agent.memory.short),
+          "条；长期召回已进上下文")
 
     print("\n工具路由自测通过。")
