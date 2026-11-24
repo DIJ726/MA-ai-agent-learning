@@ -53,7 +53,11 @@ DEFAULT_SYSTEM_PROMPT = (
     "Thought: 确认信息已足够。\n"
     "Final Answer: 最终回答。\n"
     "\n"
-    "注意：Observation（工具返回结果）由系统自动回填，你不要写。"
+    "硬性规则：\n"
+    "1. 凡是数值计算、复利/利息、日期推算，必须调用 calculator 工具，禁止自己心算后直接给结果。\n"
+    "2. Action Input 只写 JSON 参数，写完不要在这一行/这一段后面续写 Thought、解释或其他字段。\n"
+    "3. 一轮只输出一个 Action；拿到 Observation 后再进入下一轮。\n"
+    "4. Observation（工具返回结果）由系统自动回填，你不要写。"
 )
 
 # 已知标记：用于在文本里定位各字段边界
@@ -122,16 +126,57 @@ def _clean_action_name(action_line: Optional[str]) -> Optional[str]:
     return match.group(1) if match else name
 
 
+def _extract_json_span(text: str) -> Optional[str]:
+    """截取文本中首个平衡的 JSON 对象/数组（按括号配对，跳过字符串内括号）。
+
+    模型偶尔把下一段 Thought 续写在 Action Input 后面，这里只取到 JSON 闭合为止。
+    """
+    start = next((i for i, ch in enumerate(text) if ch in "{["), None)
+    if start is None:
+        return None
+    open_ch = text[start]
+    close_ch = "}" if open_ch == "{" else "]"
+    depth = 0
+    in_str = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 def _parse_action_input(raw: Optional[str]) -> dict:
-    """把 Action Input 文本解析成 dict；JSON 失败时把原文放进 _raw 字段。"""
+    """把 Action Input 文本解析成 dict；JSON 失败时把原文放进 _raw 字段。
+
+    先尝试整段解析；失败再截取首个平衡 JSON 对象；仍失败才降级。
+    """
     if not raw:
         return {}
     raw = raw.strip()
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else {"value": data}
-    except json.JSONDecodeError:
-        return {"_raw": raw}
+    for candidate in (raw, _extract_json_span(raw)):
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+            return data if isinstance(data, dict) else {"value": data}
+        except json.JSONDecodeError:
+            continue
+    return {"_raw": raw}
 
 
 def parse_react_step(text: str) -> ReActStep:
@@ -270,6 +315,17 @@ if __name__ == "__main__":
     assert parsed_action.action_input == {"expression": "128 * 46"}
     assert not parsed_action.is_final
     print("解析动作轮 OK：", parsed_action.action, parsed_action.action_input)
+
+    # 1b. Action Input 混入下一段 Thought 时，仍截出干净 JSON
+    mixed_sample = (
+        "Thought: 先算乘积。\n"
+        "Action: calculator\n"
+        'Action Input: {"expression": "128 * 46"}\n\n'
+        "Thought: 拿到结果后继续下一步。"
+    )
+    parsed_mixed = parse_react_step(mixed_sample)
+    assert parsed_mixed.action_input == {"expression": "128 * 46"}, parsed_mixed.action_input
+    print("混入文本解析 OK：", parsed_mixed.action_input)
 
     # 2. 解析器自测：终止轮
     final_sample = (
