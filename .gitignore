@@ -3,3 +3,5 @@
 .env.bak*
 __pycache__/
 *.pyc
+# SQLite 本地示例库（首次运行自动建表 + 种子，不入库）
+data/*.db

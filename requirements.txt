@@ -2,3 +2,5 @@
 # 安装：python -m pip install -r requirements.txt
 requests>=2.31
 httpx>=0.27
+# MCP Python SDK（第 4 周：自定义 MCP Server / Client）
+mcp>=2.3.0
