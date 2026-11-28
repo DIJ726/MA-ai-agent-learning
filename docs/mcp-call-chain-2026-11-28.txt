@@ -1,0 +1,32 @@
+MCP 调用链路文本存档（W4 周六，2026-11-28）
+说明：本文件由 mcp_client.py 内存直连订单 Server 的自测输出原样保存。
+本轮 MCP Inspector UI 因本机 npm registry 下载限速未能启动（详见 notes/2026-11-28_mcp-inspector.md），
+故链路先以 Client 控制台日志形式存档；Inspector 交互截图为遗留项，待网络恢复后补齐。
+连接方式：内存直连 Client(mcp_order_server.server)，未走网络端口。
+
+=== Client 发现的工具 ===
+- get_order: 按订单号查询一单，返回该订单的客户、商品、金额、状态和下单时间。
+
+Args:
+    order_id: 订单号，例如 SO-20261101。
+
+  input_schema: {'type': 'object', 'properties': {'order_id': {'title': 'Order Id', 'type': 'string'}}, 'required': ['order_id'], 'title': 'get_orderArguments'}
+- list_orders: 按客户名或订单状态筛选订单；条件留空则不过滤。返回最近的若干单。
+
+Args:
+    customer: 客户名，模糊匹配；留空表示不限客户。
+    status: 订单状态（待支付/已支付/已发货/已完成）；留空表示不限状态。
+    limit: 最多返回条数，范围 1–50，默认 10。
+
+  input_schema: {'type': 'object', 'properties': {'customer': {'default': '', 'title': 'Customer', 'type': 'string'}, 'status': {'default': '', 'title': 'Status', 'type': 'string'}, 'limit': {'default': 10, 'title': 'Limit', 'type': 'integer'}}, 'title': 'list_ordersArguments'}
+
+=== call get_order(SO-20261101) ===
+订单详情：
+SO-20261101 | 张伟 | 机械键盘 K87 | ¥329.00 | 已完成 | 2026-11-01 10:20
+
+=== call list_orders(status=已完成) ===
+共 2 单（按下单时间倒序）：
+SO-20261104 | 王强 | USB 扩展坞 | ¥219.90 | 已完成 | 2026-11-08 16:30
+SO-20261101 | 张伟 | 机械键盘 K87 | ¥329.00 | 已完成 | 2026-11-01 10:20
+
+MCP Client 内存自测通过。
